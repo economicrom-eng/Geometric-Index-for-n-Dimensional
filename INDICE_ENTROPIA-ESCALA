@@ -1,0 +1,139 @@
+# ============================================================
+# INDICE ENTROPIA-ESCALA: aplicacion a COFOG (Eurostat) y
+# escenarios sinteticos. Genera Tabla 1, Tabla 2 y Figuras 1-2.
+# Requiere: eurostat, dplyr, tidyr, ggplot2, ggrepel, ggforce, patchwork
+# ============================================================
+# Instala en R si no tienes aun estos paquetes instalados en R
+# install.packages(c("eurostat", "dplyr", "tidyr", "ggplot2",
+# "ggrepel", "ggforce", "patchwork"), dependencies = TRUE)
+library(eurostat); library(dplyr); library(tidyr)
+library(ggplot2); library(ggrepel); library(ggforce); library(patchwork)
+
+ano <- 2024      # anio de analisis
+L   <- 30        # tope fijo (% PIB) por funcion, fijado antes de calcular
+
+# 1. DESCARGA Y PANEL ------------------------------------------
+raw <- get_eurostat("gov_10a_exp", time_format = "num",
+                    filters = list(unit = "PC_GDP", sector = "S13",
+                                   na_item = "TE"))
+if ("TIME_PERIOD" %in% names(raw)) raw <- rename(raw, time = TIME_PERIOD)
+if (inherits(raw$time, "Date")) raw$time <- as.numeric(format(raw$time, "%Y"))
+fecha_extraccion <- Sys.Date()
+cat("Fuente: Eurostat gov_10a_exp | anio:", ano,
+    "| extraido el:", format(fecha_extraccion), "\n")
+
+funciones <- c(GF01 = "Serv. generales", GF02 = "Defensa",
+               GF03 = "Orden público", GF04 = "Asuntos econ.",
+               GF05 = "Ambiente", GF06 = "Vivienda", GF07 = "Salud",
+               GF08 = "Cultura", GF09 = "Educación", GF10 = "Prot. social")
+paises <- c(eurostat::eu_countries$code, "CH", "NO", "IS")
+
+panel <- raw %>%
+  filter(time == ano, cofog99 %in% names(funciones), geo %in% paises) %>%
+  select(geo, cofog99, values) %>%
+  pivot_wider(names_from = cofog99, values_from = values)
+panel <- panel[complete.cases(panel), c("geo", names(funciones))]
+write.csv(panel, paste0("datos_cofog_", ano, ".csv"), row.names = FALSE)
+cat("Paises con datos completos:", nrow(panel), "\n")
+
+X <- as.matrix(panel[, names(funciones)]); rownames(X) <- panel$geo
+X[X < 0] <- 0
+n <- ncol(X)
+stopifnot(all(X <= L))
+
+# 2. METRICAS --------------------------------------------------
+entropia_norm <- function(x) {                    # Ec. (1), 0*ln(0) = 0
+  p <- x / sum(x); p <- p[p > 0]
+  -sum(p * log(p)) / log(n)
+}
+escala    <- function(x, q, L) (mean(x^q))^(1 / q) / L        # Ec. (2)
+dist_norm <- function(H, S) sqrt((1 - H)^2 + (1 - S)^2) / sqrt(2)  # Ec. (3)
+
+res <- data.frame(geo = rownames(X), Total = rowSums(X))
+res$H     <- apply(X, 1, entropia_norm)
+res$S1    <- apply(X, 1, escala, q = 1, L = L)
+res$S2    <- apply(X, 1, escala, q = 2, L = L)
+res$D1    <- dist_norm(res$H, res$S1)
+res$D2    <- dist_norm(res$H, res$S2)
+res$HHI   <- apply(X, 1, function(x) sum((x / sum(x))^2))
+res$Theil <- 1 - res$H                            # Theil / ln(n)
+stopifnot(isTRUE(all.equal(res$S2, res$S1 * sqrt(n * res$HHI))))
+
+# Parte de D^2 (q = 1) explicada por la escala
+res$parte_escala <- (1 - res$S1)^2 / ((1 - res$H)^2 + (1 - res$S1)^2)
+
+cat("\nTABLA 1: cinco menores y cinco mayores D1\n")
+print(res %>% arrange(D1) %>% slice(c(1:5, (n() - 4):n())) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+cat("\nParte de D^2 explicada por la escala:\n")
+print(summary(res$parte_escala))
+cat("\nCorrelaciones de Spearman:\n")
+print(round(cor(res[, c("D1", "D2", "H", "S1", "S2", "HHI", "Theil")],
+                method = "spearman"), 2))
+
+Ls <- c(30, 40, 50)                               # sensibilidad al tope
+rk <- sapply(Ls, function(Lx)
+  rank(dist_norm(res$H, apply(X, 1, escala, q = 1, L = Lx))))
+colnames(rk) <- paste0("L", Ls)
+cat("\nSpearman entre rankings con distinto L:\n")
+print(round(cor(rk, method = "spearman"), 3))
+
+# 3. ESCENARIOS SINTETICOS (mismo total = 80, n = 4, L = 40) ----
+esc <- list(Uniforme = c(20, 20, 20, 20), Moderado = c(28, 22, 18, 12),
+            Concentrado = c(38, 20, 14, 8), Extremo = c(40, 20, 10, 10))
+tab_esc <- t(sapply(esc, function(x) {
+  p <- x / sum(x); H <- -sum(p * log(p)) / log(length(x))
+  c(H  = H,
+    D2 = dist_norm(H, sqrt(mean(x^2)) / 40),
+    D1 = dist_norm(H, mean(x) / 40))
+}))
+cat("\nTABLA 2: escenarios sintéticos\n")
+print(round(tab_esc, 4))
+
+# 4. FIGURA 1: PLANO ENTROPIA-ESCALA (ancho de una columna) ----
+plano <- res %>%
+  transmute(geo, H, `q = 1 (media)` = S1, `q = 2 (norma)` = S2) %>%
+  pivot_longer(-c(geo, H), names_to = "q", values_to = "S")
+p_plano <- ggplot(plano, aes(H, S, label = geo)) +
+  geom_point(color = "steelblue", size = 1.4) +
+  geom_text_repel(size = 2.2, max.overlaps = Inf) +
+  facet_wrap(~q, ncol = 1) +
+  coord_cartesian(xlim = c(min(plano$H) - 0.01, 1),
+                  ylim = c(0, max(plano$S) * 1.15)) +
+  labs(x = "Entropía normalizada",
+       y = "Escala relativa al tope L") +
+  theme_minimal(base_size = 8)
+ggsave("plano_entropia_escala.png", p_plano, width = 3.5, height = 6,
+       dpi = 600, bg = "white")
+
+# 5. FIGURA 2: RADARES (casos de menor y mayor entropia) -------
+radar <- function(g) {
+  v   <- X[g, ] / L                               # r_i = x_i / L
+  ang <- 2 * pi * (seq_len(n) - 1) / n            # Ec. (4)
+  pol <- data.frame(x = v * cos(ang), y = v * sin(ang))
+  pol_c <- rbind(pol, pol[1, ])
+  etiq <- data.frame(x = 1.1 * cos(ang), y = 1.1 * sin(ang),
+                     t = unname(funciones),
+                     hj = ifelse(cos(ang) > 0.1, 0,
+                                 ifelse(cos(ang) < -0.1, 1, 0.5)))
+  r <- res[res$geo == g, ]
+  ggplot() +
+    geom_circle(data = data.frame(x0 = 0, y0 = 0, r = 1),
+                aes(x0 = x0, y0 = y0, r = r), color = "grey70") +
+    geom_polygon(data = pol_c, aes(x, y), fill = "steelblue", alpha = 0.4) +
+    geom_path(data = pol_c, aes(x, y), color = "darkblue", linewidth = 0.6) +
+    geom_point(data = pol, aes(x, y), color = "darkblue", size = 1.2) +
+    geom_text(data = etiq, aes(x, y, label = t, hjust = hj), size = 2) +
+    coord_fixed(xlim = c(-2.1, 2.1), ylim = c(-1.3, 1.3)) +
+    labs(title = g,
+         subtitle = sprintf("H = %.3f | S1 = %.3f | D1 = %.3f",
+                            r$H, r$S1, r$D1)) +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 9),
+          plot.subtitle = element_text(hjust = 0.5, size = 7))
+}
+sel <- unique(c(res$geo[which.min(res$H)], res$geo[which.max(res$H)]))
+p_rad <- wrap_plots(lapply(sel, radar), nrow = 2)
+ggsave("radares_cofog.png", p_rad, width = 3.5, height = 4.6,
+       dpi = 600, bg = "white")
+print(p_plano); print(p_rad)
